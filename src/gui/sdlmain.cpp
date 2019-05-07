@@ -22,6 +22,8 @@
 #endif
 
 #include "config.h"
+#include <fstream>
+#include <sstream>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -58,57 +60,10 @@
 #define MAPPERFILE "mapper-" VERSION ".map"
 //#define DISABLE_JOYSTICK
 
+
 #if C_OPENGL
-/* Enable OpenGL support */
-#define SDL_VIDEO_OPENGL	1
-#define SDL_VIDEO_OPENGL_GLX 1
-
-#include <GL/gl.h>
-#include <GL/glext.h>
 #include <GL/glew.h>
-#include <GL/glu.h>
-
-#ifndef APIENTRY
-#define APIENTRY
-#endif
-#ifndef APIENTRYP
-#define APIENTRYP APIENTRY *
-#endif
-
-#ifndef GLAPIENTRY
-#define GLAPIENTRY
-#endif
-
-#ifndef GLAPIENTRY
-#define GLAPIENTRY GLAPIENTRY *
-#endif
-
-#ifndef GL_ARB_pixel_buffer_object
-#define GL_ARB_pixel_buffer_object 1
-#define GL_PIXEL_PACK_BUFFER_ARB           0x88EB
-#define GL_PIXEL_UNPACK_BUFFER_ARB         0x88EC
-#define GL_PIXEL_PACK_BUFFER_BINDING_ARB   0x88ED
-#define GL_PIXEL_UNPACK_BUFFER_BINDING_ARB 0x88EF
-#endif
-
-#ifndef GL_ARB_vertex_buffer_object
-#define GL_ARB_vertex_buffer_object 1
-typedef void (APIENTRYP PFNGLGENBUFFERSARBPROC) (GLsizei n, GLuint *buffers);
-typedef void (APIENTRYP PFNGLBINDBUFFERARBPROC) (GLenum target, GLuint buffer);
-typedef void (APIENTRYP PFNGLDELETEBUFFERSARBPROC) (GLsizei n, const GLuint *buffers);
-typedef void (APIENTRYP PFNGLBUFFERDATAARBPROC) (GLenum target, GLsizeiptr size, const GLvoid *data, GLenum usage);
-typedef GLvoid* (APIENTRYP PFNGLMAPBUFFERARBPROC) (GLenum target, GLenum access);
-typedef GLboolean (APIENTRYP PFNGLUNMAPBUFFERARBPROC) (GLenum target);
-#endif
-
-PFNGLGENBUFFERSARBPROC emscripten_glGenBuffersARB = NULL;
-PFNGLBINDBUFFERARBPROC emscripten_glBindBufferARB = NULL;
-PFNGLDELETEBUFFERSARBPROC emscripten_glDeleteBuffersARB = NULL;
-PFNGLBUFFERDATAARBPROC emscripten_glBufferDataARB = NULL;
-PFNGLMAPBUFFERARBPROC emscripten_glMapBufferARB = NULL;
-PFNGLUNMAPBUFFERARBPROC emscripten_glUnmapBufferARB = NULL;
-
-
+#include "SDL_opengl.h"
 #endif //C_OPENGL
 
 #if !(ENVIRON_INCLUDED)
@@ -170,6 +125,7 @@ enum PRIORITY_LEVELS {
 	PRIORITY_LEVEL_HIGHEST
 };
 
+static SDL_Window *glWindow = NULL;
 
 struct SDL_Block {
 	bool inited;
@@ -214,20 +170,26 @@ struct SDL_Block {
 		SCREEN_TYPES want_type;
 	} desktop;
 #if C_OPENGL
-	struct {
-#if SDL_VERSION_ATLEAST(2,0,0)
+    struct {
 		SDL_GLContext context;
-#endif
-		Bitu pitch;
 		void * framebuf;
-		GLuint buffer;
+		Bitu pitch;
 		GLuint texture;
-		GLuint displaylist;
 		GLint max_texsize;
 		bool bilinear;
-		bool packed_pixel;
-		bool paletted_texture;
-		bool pixel_buffer_object;
+
+		std::string vertex_shader_src;
+		std::string fragment_shader_src;
+		GLuint program_object;
+		GLuint vao;
+		GLuint vertex_vbo;
+		GLuint texture_vbo;
+		GLuint ubo;
+		GLuint vertex_shader;
+		GLuint fragment_shader;
+
+		GLfloat vertex_data[12];
+		GLfloat texture_data[8];
 	} opengl;
 #endif	// C_OPENGL
 #if !SDL_VERSION_ATLEAST(2,0,0)
@@ -278,66 +240,52 @@ struct SDL_Block {
 
 static SDL_Block sdl;
 
-#if !SDL_VERSION_ATLEAST(2,0,0)
+#if C_OPENGL
+const std::string vertex_shader_default_src =
+	"#version 330 core\n"
+	"\n"
+	"layout(location = 0) in vec4 position;\n"
+	"layout(location = 1) in vec2 textureCoord;\n"
+	"\n"
+	"out vec2 texCoord;\n"
+	"\n"
+	"void main()\n"
+	"{\n"
+	"	gl_Position = position;\n"
+	"	texCoord = textureCoord;\n"
+	"}\n";
 
-#define SETMODE_SAVES 1  //Don't set Video Mode if nothing changes.
-#define SETMODE_SAVES_CLEAR 1 //Clear the screen, when the Video Mode is reused
-SDL_Surface* SDL_SetVideoMode_Wrap(int width,int height,int bpp,Bit32u flags){
-#if SETMODE_SAVES
-	static int i_height = 0;
-	static int i_width = 0;
-	static int i_bpp = 0;
-	static Bit32u i_flags = 0;
-	if (sdl.surface != NULL && height == i_height && width == i_width && bpp == i_bpp && flags == i_flags) {
-		// I don't see a difference, so disabled for now, as the code isn't finished either
-#if SETMODE_SAVES_CLEAR
-		//TODO clear it.
-#ifdef C_OPENGL
-		if ((flags & SDL_OPENGL)==0)
-			SDL_FillRect(sdl.surface,NULL,SDL_MapRGB(sdl.surface->format,0,0,0));
-		else {
-			glClearColor (0.0, 0.0, 0.0, 1.0);
-			glClear(GL_COLOR_BUFFER_BIT);
-			SDL_GL_SwapBuffers();
-		}
-#else //C_OPENGL
-		SDL_FillRect(sdl.surface,NULL,SDL_MapRGB(sdl.surface->format,0,0,0));
-#endif //C_OPENGL
-#endif //SETMODE_SAVES_CLEAR
-		return sdl.surface;
-	}
+const std::string fragment_shader_default_src =
+	"#version 330 core\n"
+	"\n"
+	"in vec2 texCoord;\n"
+	"uniform sampler2D decal;\n"
+	"\n"
+	"out vec4 color;"
+	"\n"
+	"void main()\n"
+	"{\n"
+	"	color = texture(decal, texCoord);\n"
+	"}\n";
 
-
-#ifdef WIN32
-	//SDL seems to crash if we are in OpenGL mode currently and change to exactly the same size without OpenGL.
-	//This happens when DOSBox is in textmode with aspect=true and output=opengl and the mapper is started.
-	//The easiest solution is to change the size. The mapper doesn't care. (PART PXX)
-
-	//Also we have to switch back to windowed mode first, as else it may crash as well.
-	//Bug: we end up with a locked mouse cursor, but at least that beats crashing. (output=opengl,aspect=true,fullscreen=true)
-	if((i_flags&SDL_OPENGL) && !(flags&SDL_OPENGL) && (i_flags&SDL_FULLSCREEN) && !(flags&SDL_FULLSCREEN)){
-		GFX_SwitchFullScreen();
-		return SDL_SetVideoMode_Wrap(width,height,bpp,flags);
-	}
-
-	//PXX
-	if ((i_flags&SDL_OPENGL) && !(flags&SDL_OPENGL) && height==i_height && width==i_width && height==480) {
-		height++;
-	}
-#endif //WIN32
-#endif //SETMODE_SAVES
-	SDL_Surface* s = SDL_SetVideoMode(width,height,bpp,flags);
-#if SETMODE_SAVES
-	if (s == NULL) return s; //Only store when successful
-	i_height = height;
-	i_width = width;
-	i_bpp = bpp;
-	i_flags = flags;
+	const GLuint POSITION_LOCATION = 0;
+	const GLuint TEXTURE_LOCATION = 1;
 #endif
-	return s;
+
+static int SDL_Init_Wrapper(void)
+{
+    // Don't init timers, GetTicks seems to work fine and they can use a fair amount of power (Macs again)
+    // Please report problems with audio and other things.
+    int result = ( SDL_Init( SDL_INIT_AUDIO|SDL_INIT_VIDEO /*|SDL_INIT_TIMER*/
+                             |SDL_INIT_NOPARACHUTE
+    ));
+    return result;
 }
 
-#endif // !SDL_VERSION_ATLEAST(2,0,0)
+static void SDL_Quit_Wrapper(void)
+{
+    SDL_Quit();
+}
 
 extern const char* RunningProgram;
 extern bool CPU_CycleAutoAdjust;
@@ -587,7 +535,8 @@ check_gotbpp:
 #endif	// !SDL_VERSION_ATLEAST(2,0,0)
 #if C_OPENGL
 	case SCREEN_OPENGL:
-		if (flags & GFX_RGBONLY || !(flags&GFX_CAN_32)) goto check_surface; // BGRA otherwise
+		//We only accept 32bit output from the scalers here
+		if (!(flags&GFX_CAN_32)) goto check_surface;
 		flags|=GFX_SCALING;
 		flags&=~(GFX_CAN_8|GFX_CAN_15|GFX_CAN_16);
 		break;
@@ -645,6 +594,33 @@ static SDL_Window * GFX_SetSDLWindowMode(Bit16u width, Bit16u height, bool fulls
 	if (sdl.opengl.context) {
 		SDL_GL_DeleteContext(sdl.opengl.context);
 		sdl.opengl.context=0;
+	}
+
+	if (sdl.opengl.vao) {
+		glBindVertexArray(0);
+		glDeleteVertexArrays(1, &sdl.opengl.vao);
+		sdl.opengl.vao = 0;
+	}
+
+	if (sdl.opengl.vertex_vbo) {
+		glDeleteBuffers(1, &sdl.opengl.vertex_vbo);
+		sdl.opengl.vertex_vbo = 0;
+	}
+
+	if (sdl.opengl.texture_vbo) {
+		glDeleteBuffers(1, &sdl.opengl.texture_vbo);
+		sdl.opengl.texture_vbo = 0;
+	}
+
+	if (sdl.opengl.ubo) {
+		glDeleteBuffers(1, &sdl.opengl.ubo);
+		sdl.opengl.ubo = 0;
+	}
+
+	if (sdl.opengl.program_object) {
+		glUseProgram(0);
+		glDeleteProgram(sdl.opengl.program_object);
+		sdl.opengl.program_object = 0;
 	}
 #endif
 	sdl.window_desired_width = width;
@@ -831,6 +807,62 @@ void GFX_TearDown(void) {
 }
 #endif
 
+
+#if C_OPENGL
+/* Create a GLSL shader object, load the shader source, and compile the shader.
+ */
+GLuint GFX_LoadGLShader(GLenum type, const char *shaderSrc) {
+
+	// Create the shader object
+	GLuint shader = 0;
+	if (!(shader = glCreateShader(type))) {
+		LOG_MSG("%s", SDL_GetError());
+		return 0;
+	}
+
+	// Load the shader source
+	glShaderSource(shader, 1, &shaderSrc, NULL);
+
+	// Compile the shader
+	glCompileShader(shader);
+
+	// Check the compile status
+	GLint compiled = 0;
+	glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+	if (!compiled) {
+		GLint infoLen = 0;
+
+		glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &infoLen);
+
+		if (infoLen > 1) {
+			std::vector<GLchar> infoLog(infoLen);
+			glGetShaderInfoLog(shader, infoLen, NULL, &infoLog[0]);
+			std::stringstream ss;
+			for (std::vector<GLchar>::iterator it = infoLog.begin(); it != infoLog.end(); ++it)
+			{
+				ss << *it;
+			}
+			LOG_MSG("SDL:OPENGL: Error compiling program: %s", ss.rdbuf()->str().c_str());
+		}
+
+		glDeleteShader(shader);
+		return 0;
+	}
+	return shader;
+}
+#endif
+
+#if C_OPENGL
+GLfloat get_texture_x(GLfloat vertex_x, GLfloat video_x, GLfloat texture_x) {
+	return (vertex_x + 1.0) / 2.0 * video_x / texture_x;
+}
+
+
+GLfloat get_texture_y(GLfloat vertex_y, GLfloat video_y, GLfloat texture_y) {
+	return (1.0 - vertex_y) / 2.0 * video_y / texture_y;
+}
+#endif
+
 Bitu GFX_SetSize(Bitu width,Bitu height,Bitu flags,double scalex,double scaley,GFX_CallBack_t callback) {
 	if (sdl.updating)
 		GFX_EndUpdate( 0 );
@@ -853,6 +885,9 @@ Bitu GFX_SetSize(Bitu width,Bitu height,Bitu flags,double scalex,double scaley,G
 	switch (sdl.desktop.want_type) {
 	case SCREEN_SURFACE:
 dosurface:
+
+        LOG_MSG("dosurface");
+
 #if !SDL_VERSION_ATLEAST(2,0,0)
 		if (flags & GFX_CAN_8) bpp=8;
 		if (flags & GFX_CAN_15) bpp=15;
@@ -925,6 +960,7 @@ dosurface:
 #endif	// !SDL_VERSION_ATLEAST(2,0,0)
 		}
 #if SDL_VERSION_ATLEAST(2,0,0)
+
 		sdl.surface = SDL_GetWindowSurface(sdl.window);
 		if (sdl.surface == NULL)
 				E_Exit("Could not retrieve window surface: %s",SDL_GetError());
@@ -966,20 +1002,17 @@ dosurface:
 #if SDL_VERSION_ATLEAST(2,0,0)
 	case SCREEN_TEXTURE:
 	{
-#if 0
-		if (!strcmp(sdl.rendererDriver, "opengles")) {
-			if (!(flags&GFX_CAN_32) || (flags & GFX_RGBONLY)) goto dosurface;
-		}
-#endif
+
 		if (!GFX_SetupWindowScaled(sdl.desktop.want_type)) {
 			LOG_MSG("SDL:Can't set video mode, falling back to surface");
 			goto dosurface;
 		}
-		if (strcmp(sdl.rendererDriver, "auto"))
-			SDL_SetHint(SDL_HINT_RENDER_DRIVER, sdl.rendererDriver);
+
+		SDL_SetHint(SDL_HINT_RENDER_DRIVER, sdl.rendererDriver);
 		sdl.renderer = SDL_CreateRenderer(sdl.window, -1,
 		                                  SDL_RENDERER_ACCELERATED |
 		                                  (sdl.desktop.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
+
 		if (!sdl.renderer) {
 			LOG_MSG("%s\n", SDL_GetError());
 			LOG_MSG("SDL:Can't create renderer, falling back to surface");
@@ -1035,11 +1068,12 @@ dosurface:
 				retFlags = GFX_CAN_32;
 				break;
 		}
-		retFlags |= GFX_SCALING;
+		//retFlags |= GFX_SCALING;
 		SDL_RendererInfo rendererInfo;
 		SDL_GetRendererInfo(sdl.renderer, &rendererInfo);
 		LOG_MSG("Using driver \"%s\" for renderer", rendererInfo.name);
 		if (rendererInfo.flags & SDL_RENDERER_ACCELERATED)
+		    LOG_MSG("Using hardware accelleration");
 			retFlags |= GFX_HARDWARE;
 		break;
 	}
@@ -1103,71 +1137,110 @@ dosurface:
 #if C_OPENGL
 	case SCREEN_OPENGL:
 	{
-		if (sdl.opengl.pixel_buffer_object) {
-			emscripten_glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
-			if (sdl.opengl.buffer) emscripten_glDeleteBuffersARB(1, &sdl.opengl.buffer);
-		} else
-		if (sdl.opengl.framebuf) {
-			free(sdl.opengl.framebuf);
-		}
-		sdl.opengl.framebuf=0;
-		if (!(flags&GFX_CAN_32) || (flags & GFX_RGBONLY)) goto dosurface; // BGRA otherwise
+
+            LOG_MSG("SCREEN_OPENGL");
+
+	    if (!(flags&GFX_CAN_32)) goto dosurface;
 		int texsize=2 << int_log2(width > height ? width : height);
 		if (texsize>sdl.opengl.max_texsize) {
 			LOG_MSG("SDL:OPENGL: No support for texturesize of %d, falling back to surface",texsize);
 			goto dosurface;
 		}
-		SDL_GL_SetAttribute( SDL_GL_DOUBLEBUFFER, 1 );
-#if SDL_VERSION_ATLEAST(2,0,0)
-		GFX_SetupWindowScaled(sdl.desktop.want_type);
-		/* We may simply use SDL_BYTESPERPIXEL
-		here rather than SDL_BITSPERPIXEL   */
-		if (!sdl.window || SDL_BYTESPERPIXEL(SDL_GetWindowPixelFormat(sdl.window))<2) {
-			LOG_MSG("SDL:OPENGL:Can't open drawing window, are you running in 16bpp(or higher) mode?");
-			goto dosurface;
-		}
-		sdl.opengl.context = SDL_GL_CreateContext(sdl.window);
-		if (sdl.opengl.context == NULL) {
-			LOG_MSG("SDL:OPENGL:Can't create OpenGL context, falling back to surface");
-			goto dosurface;
-		}
+
+        LOG_MSG("SCREEN_OPENGL SDL_GL_SetAttribute");
+
+        SDL_Renderer *renderer = NULL;
+        SDL_CreateWindowAndRenderer(640, 400, SDL_WINDOW_OPENGL, &glWindow, &renderer);
+
+		SDL_GL_MakeCurrent(sdl.window, sdl.opengl.context);
+
 		/* Sync to VBlank if desired */
 		SDL_GL_SetSwapInterval(sdl.desktop.vsync ? 1 : 0);
-#else	// !SDL_VERSION_ATLEAST(2,0,0)
-#if SDL_VERSION_ATLEAST(1, 2, 11)
-		SDL_GL_SetAttribute( SDL_GL_SWAP_CONTROL, sdl.desktop.vsync ? 1 : 0 );
-#endif
-		GFX_SetupSurfaceScaled(SDL_OPENGL,0);
-		if (!sdl.surface || sdl.surface->format->BitsPerPixel<15) {
-			LOG_MSG("SDL:OPENGL: Can't open drawing surface, are you running in 16bpp (or higher) mode?");
-			goto dosurface;
-		}
-#endif	// !SDL_VERSION_ATLEAST(2,0,0)
-		/* Create the texture and display list */
-		if (sdl.opengl.pixel_buffer_object) {
-			emscripten_glGenBuffersARB(1, &sdl.opengl.buffer);
-			emscripten_glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, sdl.opengl.buffer);
-			emscripten_glBufferDataARB(GL_PIXEL_UNPACK_BUFFER_EXT, width*height*4, NULL, GL_STREAM_DRAW_ARB);
-			emscripten_glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
-		} else
-		{
-			sdl.opengl.framebuf=malloc(width*height*4);		//32 bit color
-		}
+
+		sdl.opengl.framebuf=calloc(1, texsize*texsize*4);		//32 bit color
+
 		sdl.opengl.pitch=width*4;
-#if SDL_VERSION_ATLEAST(2,0,0)
 		int windowHeight;
 		SDL_GetWindowSize(sdl.window, NULL, &windowHeight);
+
+		GLuint fragmentShader = 0;
+		GLuint vertexShader = GFX_LoadGLShader(GL_VERTEX_SHADER, sdl.opengl.vertex_shader_src.c_str());
+		if (vertexShader) {
+			fragmentShader = GFX_LoadGLShader(GL_FRAGMENT_SHADER, sdl.opengl.fragment_shader_src.c_str());
+			if (!fragmentShader) {
+				glDeleteShader(vertexShader);
+				LOG_MSG("SDL:OPENGL: Can't compile fragment shader, falling back to stock.");
+				vertexShader = GFX_LoadGLShader(GL_VERTEX_SHADER, vertex_shader_default_src.c_str());
+				fragmentShader = GFX_LoadGLShader(GL_FRAGMENT_SHADER, fragment_shader_default_src.c_str());
+			}
+		} else {
+			LOG_MSG("SDL:OPENGL: Can't compile vertex shader, falling back to stock.");
+			vertexShader = GFX_LoadGLShader(GL_VERTEX_SHADER, vertex_shader_default_src.c_str());
+			fragmentShader = GFX_LoadGLShader(GL_FRAGMENT_SHADER, fragment_shader_default_src.c_str());
+		}
+
+        LOG_MSG("SCREEN_OPENGL glCreateProgram");
+
+		sdl.opengl.program_object = glCreateProgram();
+		if (!sdl.opengl.program_object) {
+			glDeleteShader(vertexShader);
+			glDeleteShader(fragmentShader);
+			goto dosurface;
+		}
+		glAttachShader (sdl.opengl.program_object, vertexShader);
+		glAttachShader (sdl.opengl.program_object, fragmentShader);
+		// Link the program
+		glLinkProgram (sdl.opengl.program_object);
+		// Even if we *are* successful, we may delete the shader objects
+		glDeleteShader(vertexShader);
+		glDeleteShader(fragmentShader);
+
+		// Check the link status
+		GLint isProgramLinked;
+		glGetProgramiv (sdl.opengl.program_object, GL_LINK_STATUS, &isProgramLinked);
+
+		if (!isProgramLinked)  {
+			GLint infoLen = 0;
+
+			glGetProgramiv(sdl.opengl.program_object, GL_INFO_LOG_LENGTH, &infoLen);
+
+			if (infoLen > 1) {
+				std::vector<GLchar> infoLog(infoLen);
+				glGetProgramInfoLog(sdl.opengl.program_object, infoLen, NULL, &infoLog[0]);
+				std::stringstream ss;
+				for (std::vector<GLchar>::iterator it = infoLog.begin(); it != infoLog.end(); ++it)
+				{
+					ss << *it;
+				}
+				LOG_MSG("SDL:OPENGL: Error linking program: %s", ss.rdbuf()->str().c_str());
+			}
+
+			glDeleteProgram(sdl.opengl.program_object);
+			glDeleteShader(vertexShader);
+			glDeleteShader(fragmentShader);
+
+			// Fall back to stock shaders.
+			vertexShader = GFX_LoadGLShader(GL_VERTEX_SHADER, vertex_shader_default_src.c_str());
+			fragmentShader = GFX_LoadGLShader(GL_FRAGMENT_SHADER, fragment_shader_default_src.c_str());
+			sdl.opengl.program_object = glCreateProgram();
+			glAttachShader (sdl.opengl.program_object, vertexShader);
+			glAttachShader (sdl.opengl.program_object, fragmentShader);
+			glLinkProgram (sdl.opengl.program_object);
+			glDeleteShader(vertexShader);
+			glDeleteShader(fragmentShader);
+		}
+
+        LOG_MSG("SCREEN_OPENGL glViewport");
+
 		glViewport(sdl.clip.x,windowHeight-(sdl.clip.y+sdl.clip.h),sdl.clip.w,sdl.clip.h);
-#else
-		glViewport(sdl.clip.x,sdl.surface->h-(sdl.clip.y+sdl.clip.h),sdl.clip.w,sdl.clip.h);
-#endif
-		glMatrixMode (GL_PROJECTION);
+
 		glDeleteTextures(1,&sdl.opengl.texture);
  		glGenTextures(1,&sdl.opengl.texture);
 		glBindTexture(GL_TEXTURE_2D,sdl.opengl.texture);
 		// No borders
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+
 		if (sdl.opengl.bilinear) {
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1176,40 +1249,89 @@ dosurface:
 			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		}
 
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texsize, texsize, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, 0);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texsize, texsize, 0, GL_BGRA, GL_UNSIGNED_BYTE, sdl.opengl.framebuf);
 
 		glClearColor (0.0, 0.0, 0.0, 1.0);
-		glShadeModel (GL_FLAT);
-		glDisable (GL_DEPTH_TEST);
-		glDisable (GL_LIGHTING);
-		glDisable(GL_CULL_FACE);
-		glEnable(GL_TEXTURE_2D);
-		glMatrixMode (GL_MODELVIEW);
-		glLoadIdentity ();
-
-		GLfloat tex_width=((GLfloat)(width)/(GLfloat)texsize);
-		GLfloat tex_height=((GLfloat)(height)/(GLfloat)texsize);
-
-		if (glIsList(sdl.opengl.displaylist)) glDeleteLists(sdl.opengl.displaylist, 1);
-		sdl.opengl.displaylist = glGenLists(1);
-		glNewList(sdl.opengl.displaylist, GL_COMPILE);
-		glClear(GL_COLOR_BUFFER_BIT);
+		//glShadeModel (GL_FLAT);
 		glBindTexture(GL_TEXTURE_2D, sdl.opengl.texture);
-		glBegin(GL_QUADS);
-		// lower left
-		glTexCoord2f(0,tex_height); glVertex2f(-1.0f,-1.0f);
-		// lower right
-		glTexCoord2f(tex_width,tex_height); glVertex2f(1.0f, -1.0f);
-		// upper right
-		glTexCoord2f(tex_width,0); glVertex2f(1.0f, 1.0f);
+
+		// Time to take advantage of the shader now
+		glUseProgram(sdl.opengl.program_object);
+
+		LOG_MSG("Game resolution: %dx%d", width, height);
+
+		float uniform_block[6];
+		uniform_block[0] = width;
+		uniform_block[1] = height;
+		uniform_block[2] = texsize;
+		uniform_block[3] = texsize;
+		uniform_block[4] = sdl.clip.w;
+		uniform_block[5] = sdl.clip.h;
+
+		// Pack the uniforms block
+		glGenBuffers(1, &sdl.opengl.ubo);
+		glBindBuffer(GL_UNIFORM_BUFFER, sdl.opengl.ubo);
+		//glBindBufferBase(GL_UNIFORM_BUFFER, 0, sdl.opengl.ubo);
+		glBufferData(GL_UNIFORM_BUFFER, 24, uniform_block, GL_STATIC_DRAW);
+		glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+		glGenVertexArrays(1, &sdl.opengl.vao);
+		glBindVertexArray(sdl.opengl.vao);
+
+		// Vertex coordinates
+
 		// upper left
-		glTexCoord2f(0,0); glVertex2f(-1.0f, 1.0f);
-		glEnd();
-		glEndList();
+		sdl.opengl.vertex_data[0] = -1.0f;
+		sdl.opengl.vertex_data[1] = 1.0f;
+		sdl.opengl.vertex_data[2] = 0.0f;
+
+		// lower left
+		sdl.opengl.vertex_data[3] = -1.0f;
+		sdl.opengl.vertex_data[4] = -1.0f;
+		sdl.opengl.vertex_data[5] = 0.0f;
+
+		// upper right
+		sdl.opengl.vertex_data[6] = 1.0f;
+		sdl.opengl.vertex_data[7] = 1.0f;
+		sdl.opengl.vertex_data[8] = 0.0f;
+
+		// lower right
+		sdl.opengl.vertex_data[9] = 1.0f;
+		sdl.opengl.vertex_data[10] = -1.0f;
+		sdl.opengl.vertex_data[11] = 0.0f;
+
+		glGenBuffers(1, &sdl.opengl.vertex_vbo);
+		glBindBuffer(GL_ARRAY_BUFFER, sdl.opengl.vertex_vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(sdl.opengl.vertex_data), sdl.opengl.vertex_data, GL_STATIC_DRAW);
+
+		glVertexAttribPointer(POSITION_LOCATION, 3, GL_FLOAT, GL_FALSE, 3 * sizeof (GLfloat), (GLvoid *)0);
+		glEnableVertexAttribArray(POSITION_LOCATION);
+
+		// upper left
+		sdl.opengl.texture_data[0] = get_texture_x(-1.0f, width, texsize);
+		sdl.opengl.texture_data[1] = get_texture_y(1.0f, height, texsize);
+
+		// lower left
+		sdl.opengl.texture_data[2] = get_texture_x(-1.0f, width, texsize);
+		sdl.opengl.texture_data[3] = get_texture_y(-1.0f, height, texsize);
+
+		// upper right
+		sdl.opengl.texture_data[4] = get_texture_x(1.0f, width, texsize);
+		sdl.opengl.texture_data[5] = get_texture_y(1.0f, height, texsize);
+
+		// lower right
+		sdl.opengl.texture_data[6] = get_texture_x(1.0f, width, texsize);
+		sdl.opengl.texture_data[7] = get_texture_y(-1.0f, height, texsize);
+
+		glGenBuffers(1, &sdl.opengl.texture_vbo);
+		glBindBuffer(GL_ARRAY_BUFFER, sdl.opengl.texture_vbo);
+		glBufferData(GL_ARRAY_BUFFER, sizeof(sdl.opengl.texture_data), sdl.opengl.texture_data, GL_STATIC_DRAW);
+		glVertexAttribPointer(TEXTURE_LOCATION, 2, GL_FLOAT, GL_TRUE, 2 * sizeof (GLfloat), (GLvoid *)0);
+		glEnableVertexAttribArray(TEXTURE_LOCATION);
+
 		sdl.desktop.type=SCREEN_OPENGL;
 		retFlags = GFX_CAN_32 | GFX_SCALING;
-		if (sdl.opengl.pixel_buffer_object)
-			retFlags |= GFX_HARDWARE;
+		retFlags |= GFX_HARDWARE;
 	break;
 		}//OPENGL
 #endif	//C_OPENGL
@@ -1439,13 +1561,8 @@ bool GFX_StartUpdate(Bit8u * & pixels,Bitu & pitch) {
 #endif	// !SDL_VERSION_ATLEAST(2,0,0)
 #if C_OPENGL
 	case SCREEN_OPENGL:
-		if(sdl.opengl.pixel_buffer_object) {
-		    emscripten_glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, sdl.opengl.buffer);
-		    pixels=(Bit8u *)emscripten_glMapBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, GL_WRITE_ONLY);
-		} else
-		{
-		    pixels=(Bit8u *)sdl.opengl.framebuf;
-		}
+	    pixels=(Bit8u *)sdl.opengl.framebuf;
+
 		pitch=sdl.opengl.pitch;
 		sdl.updating=true;
 		return true;
@@ -1557,20 +1674,6 @@ void GFX_EndUpdate( const Bit16u *changedLines ) {
 #endif	// !SDL_VERSION_ATLEAST(2,0,0)
 #if C_OPENGL
 	case SCREEN_OPENGL:
-		if (sdl.opengl.pixel_buffer_object) {
-			emscripten_glUnmapBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT);
-			glBindTexture(GL_TEXTURE_2D, sdl.opengl.texture);
-			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-					sdl.draw.width, sdl.draw.height, GL_BGRA_EXT,
-					GL_UNSIGNED_INT_8_8_8_8_REV, 0);
-			emscripten_glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
-			glCallList(sdl.opengl.displaylist);
-#if SDL_VERSION_ATLEAST(2,0,0)
-			SDL_GL_SwapWindow(sdl.window);
-#else
-			SDL_GL_SwapBuffers();
-#endif
-		} else
 		if (changedLines) {
 			Bitu y = 0, index = 0;
 			glBindTexture(GL_TEXTURE_2D, sdl.opengl.texture);
@@ -1587,12 +1690,9 @@ void GFX_EndUpdate( const Bit16u *changedLines ) {
 				}
 				index++;
 			}
-			glCallList(sdl.opengl.displaylist);
-#if SDL_VERSION_ATLEAST(2,0,0)
+			glClear(GL_COLOR_BUFFER_BIT);
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 			SDL_GL_SwapWindow(sdl.window);
-#else
-			SDL_GL_SwapBuffers();
-#endif
 		}
 		break;
 #endif
@@ -1815,6 +1915,9 @@ static void GUI_StartUp(Section * sec) {
 		sdl.priority.nofocus=PRIORITY_LEVEL_PAUSE;
 	}
 
+	sdl.priority.focus = PRIORITY_LEVEL_HIGHEST;
+	sdl.priority.nofocus = PRIORITY_LEVEL_HIGHEST;
+
 	SetPriority(sdl.priority.focus); //Assume focus on startup
 	sdl.mouse.locked=false;
 	mouselocked=false; //Global for mapper
@@ -1902,26 +2005,35 @@ static void GUI_StartUp(Section * sec) {
 
 	sdl.mouse.autoenable=section->Get_bool("autolock");
 	if (!sdl.mouse.autoenable) SDL_ShowCursor(SDL_DISABLE);
-	sdl.mouse.autolock=false;
+	sdl.mouse.autolock=true;
 	sdl.mouse.sensitivity=section->Get_int("sensitivity");
 	std::string output=section->Get_string("output");
 
-    output = "opengl";
+    output = "texturenb";
 
 	/* Setup Mouse correctly if fullscreen */
 	if(sdl.desktop.fullscreen) GFX_CaptureMouse();
 
+	//GFX_CaptureMouse();
+
 	if (output == "surface") {
 		sdl.desktop.want_type=SCREEN_SURFACE;
+		LOG_MSG("RENDER surface");
 #if SDL_VERSION_ATLEAST(2,0,0)
 
 
 	} else if (output == "texture") {
 		sdl.desktop.want_type=SCREEN_TEXTURE;
+
+		LOG_MSG("RENDER linear");
+
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 	} else if (output == "texturenb") {
 		sdl.desktop.want_type=SCREEN_TEXTURE;
 		// Currently the default, but... oh well
+
+		LOG_MSG("RENDER nearest");
+
 		SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
 #else	// !SDL_VERSION_ATLEAST(2,0,0)
 #if (HAVE_DDRAW_H) && defined(WIN32)
@@ -1952,7 +2064,7 @@ static void GUI_StartUp(Section * sec) {
 	sdl.window=0;
 	sdl.renderer=0;
 	sdl.rendererDriver = section->Get_string("renderer");
-	sdl.rendererDriver = "opengl";
+	sdl.rendererDriver = "auto";
 	LOG_MSG("setting renderer");
 
 	LOG_MSG("sdl.rendererDriver: %s", sdl.rendererDriver);
@@ -1960,67 +2072,69 @@ static void GUI_StartUp(Section * sec) {
 	sdl.overlay=0;
 #endif
 
+	LOG_MSG("sdl.desktop.want_type: %d", (int) sdl.desktop.want_type);
 
 #if C_OPENGL
-   if(sdl.desktop.want_type==SCREEN_OPENGL){ /* OPENGL is requested */
-#if SDL_VERSION_ATLEAST(2,0,0)
+   if(sdl.desktop.want_type==SCREEN_OPENGL) { /* OPENGL is requested */
 
-	LOG_MSG("sdl.rendererDriver: %s", sdl.rendererDriver);
+	    LOG_MSG("sdl.desktop.want_type==SCREEN_OPENGL");
 
-	if (!GFX_SetSDLOpenGLWindow(640,400)) {
-		LOG_MSG("Could not create OpenGL window, switching back to surface");
-		sdl.desktop.want_type=SCREEN_SURFACE;
-	} else {
-		sdl.opengl.context = SDL_GL_CreateContext(sdl.window);
-		if (sdl.opengl.context == 0) {
-			LOG_MSG("Could not create OpenGL context, switching back to surface");
+		if (!GFX_SetSDLOpenGLWindow(640,400)) {
+			LOG_MSG("Could not create OpenGL window, switching back to surface");
 			sdl.desktop.want_type=SCREEN_SURFACE;
+		} else {
+			sdl.opengl.context = SDL_GL_CreateContext(sdl.window);
+			if (sdl.opengl.context == 0) {
+				LOG_MSG("Could not create OpenGL context, switching back to surface");
+				sdl.desktop.want_type=SCREEN_SURFACE;
+			}
 		}
-	}
-	if (sdl.desktop.want_type==SCREEN_OPENGL) {
-#else	// Same story but for SDL 1.2
-	sdl.surface=SDL_SetVideoMode_Wrap(640,400,0,SDL_OPENGL);
-	if (sdl.surface == NULL) {
-		LOG_MSG("Could not initialize OpenGL, switching back to surface");
-		sdl.desktop.want_type=SCREEN_SURFACE;
-	} else {
-#endif	// End of SDL specific video mode check. Let's assume it has passed...
-	sdl.opengl.buffer=0;
-	sdl.opengl.framebuf=0;
-	sdl.opengl.texture=0;
-	sdl.opengl.displaylist=0;
-
-	LOG_MSG("Really using opengl: %s", sdl.rendererDriver);
 
 
-	glGetIntegerv (GL_MAX_TEXTURE_SIZE, &sdl.opengl.max_texsize);
+		sdl.opengl.program_object=0;
+		sdl.opengl.vao = 0;
+		sdl.opengl.vertex_vbo = 0;
+		sdl.opengl.ubo = 0;
+		sdl.opengl.vertex_shader = 0;
+		sdl.opengl.fragment_shader = 0;
+		sdl.opengl.vertex_shader_src = vertex_shader_default_src;
+		sdl.opengl.fragment_shader_src = fragment_shader_default_src;
+		std::string shader_filename=section->Get_string("gl.shader");
+		if (!shader_filename.empty()) {
 
-	LOG_MSG("OpenGL max_textsize: %d", (int) &sdl.opengl.max_texsize);
+	        LOG_MSG("custom shader");
 
-    /*
-	emscripten_glGenBuffersARB = (PFNGLGENBUFFERSARBPROC)emscripten_GetProcAddress("emscripten_glGenBuffersARB");
-	emscripten_glBindBufferARB = (PFNGLBINDBUFFERARBPROC)emscripten_GetProcAddress("emscripten_glBindBufferARB");
-	emscripten_glDeleteBuffersARB = (PFNGLDELETEBUFFERSARBPROC)emscripten_GetProcAddress("emscripten_glDeleteBuffersARB");
-	emscripten_glBufferDataARB = (PFNGLBUFFERDATAARBPROC)emscripten_GetProcAddress("emscripten_glBufferDataARB");
-	emscripten_glMapBufferARB = (PFNGLMAPBUFFERARBPROC)emscripten_GetProcAddress("emscripten_glMapBufferARB");
-	emscripten_glUnmapBufferARB = (PFNGLUNMAPBUFFERARBPROC)emscripten_GetProcAddress("emscripten_glUnmapBufferARB");
-    */
+			std::string config_path;
+			Cross::GetPlatformConfigDir(config_path);
 
+			std::string vertex_shader_path = config_path + "shaders" + CROSS_FILESPLIT + shader_filename + ".vert";
+			std::ifstream vertex_fstream(vertex_shader_path.c_str());
+			std::stringstream ss;
+			if (vertex_fstream.is_open()) {
+				ss << vertex_fstream.rdbuf();
+				sdl.opengl.vertex_shader_src = ss.str();
+			} else {
+				LOG_MSG("Unable to open: %s", vertex_shader_path.c_str());
+			}
 
-	const char * gl_ext = (const char *)glGetString (GL_EXTENSIONS);
-	if(gl_ext && *gl_ext){
-		sdl.opengl.packed_pixel = 1;
+			ss.str("");
+			ss.clear();
 
-	    LOG_MSG("using gl_ext");
-
-		sdl.opengl.paletted_texture = 1;
-		sdl.opengl.pixel_buffer_object = 1;
-
-	    LOG_MSG("sdl.opengl.pixel_buffer_object %d", sdl.opengl.pixel_buffer_object);
-    	} else {
-		sdl.opengl.packed_pixel=sdl.opengl.paletted_texture=false;
-	}
-	}
+			std::string fragment_shader_path = config_path + "shaders" + CROSS_FILESPLIT + shader_filename + ".frag";
+			std::ifstream fragment_fstream(fragment_shader_path.c_str());
+			if (fragment_fstream.is_open()) {
+				ss << fragment_fstream.rdbuf();
+				sdl.opengl.fragment_shader_src = ss.str();
+			} else {
+				LOG_MSG("Unable to open: %s", fragment_shader_path.c_str());
+			}
+		}
+		sdl.opengl.texture=0;
+		glGetIntegerv (GL_MAX_TEXTURE_SIZE, &sdl.opengl.max_texsize);
+		glewExperimental = GL_TRUE;
+        LOG_MSG("before glewInit");
+		glewInit();
+        LOG_MSG("after glewInit");
 	} /* OPENGL is requested end */
 
 #endif	//OPENGL
@@ -2028,6 +2142,10 @@ static void GUI_StartUp(Section * sec) {
 #if SDL_VERSION_ATLEAST(2,0,0)
 	if (!GFX_SetSDLSurfaceWindow(640,400))
 		E_Exit("Could not initialize video: %s",SDL_GetError());
+
+    // enable 3D accelleration
+    SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, sdl.rendererDriver);
+
 	sdl.surface = SDL_GetWindowSurface(sdl.window);
 	SDL_Rect splash_rect=GFX_GetSDLSurfaceSubwindowDims(640,400);
 	sdl.desktop.sdl2pixelFormat = SDL_GetWindowPixelFormat(sdl.window);
@@ -2068,9 +2186,11 @@ static void GUI_StartUp(Section * sec) {
  */
 #if !defined(EMSCRIPTEN) || defined(EMTERPRETER_SYNC)
 /* Please leave the Splash screen stuff in working order in DOSBox. We spend a lot of time making DOSBox. */
-	SDL_Surface* splash_surf = NULL;
+
+    SDL_Surface* splash_surf = NULL;
+
 #ifdef EMSCRIPTEN
-	if (output != "texture" && output != "texturenb")
+	if (output != "texture" && output != "texturenb" && output != "opengl" && output != "openglnb")
 #endif
 		splash_surf = SDL_CreateRGBSurface(SDL_SWSURFACE, 640, 400, 32, rmask, gmask, bmask, 0);
 	if (splash_surf) {
@@ -2601,7 +2721,7 @@ void Config_Add_SDL() {
 		"opengl", "openglnb",
 #endif
 		0 };
-#if SDL_VERSION_ATLEAST(2, 0, 0) && !defined(EMSCRIPTEN)
+#if SDL_VERSION_ATLEAST(2, 0, 0)
 	/* SDL 2 for Emscripten doesn't support "texture" yet. */
 	Pstring = sdl_sec->Add_string("output",Property::Changeable::Always,"texture");
 #else
@@ -2928,13 +3048,13 @@ int main(int argc, char* argv[]) {
 		Module['screenIsReadOnly'] = true;
 		// set nearest neighbor scaling, for sharply upscaled pixels
 		var canvasStyle = Module['canvas'].style;
-		canvasStyle.imageRendering = "optimizeQuality";
+		canvasStyle.imageRendering = "optimizeSpeed";
 		canvasStyle.imageRendering = "-moz-crisp-edges";
 		canvasStyle.imageRendering = "-o-crisp-edges";
 		canvasStyle.imageRendering = "-webkit-optimize-contrast";
 		canvasStyle.imageRendering = "optimize-contrast";
 		canvasStyle.imageRendering = "crisp-edges";
-		canvasStyle.imageRendering = "smooth";
+		canvasStyle.imageRendering = "pixelated";
 	);
 	if (emscripten_set_pointerlockchange_callback(NULL, NULL, true,
 	                                              em_pointerlock_callback)

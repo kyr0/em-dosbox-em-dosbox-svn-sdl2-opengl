@@ -597,7 +597,12 @@ void RENDER_Init(Section * sec) {
 	std::string f = prop->GetSection()->Get_string("force");
 	render.scale.forced = false;
 	if(f == "forced") render.scale.forced = true;
-   
+
+	scaler = "none";
+	render.scale.forced = false;
+	LOG_MSG("Disable scalers, set to: none");
+
+
 	if (scaler == "none") { render.scale.op = scalerOpNormal;render.scale.size = 1; }
 	else if (scaler == "normal2x") { render.scale.op = scalerOpNormal;render.scale.size = 2; }
 	else if (scaler == "normal3x") { render.scale.op = scalerOpNormal;render.scale.size = 3; }

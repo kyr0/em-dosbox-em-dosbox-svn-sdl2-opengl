@@ -313,6 +313,10 @@ AC_ARG_WITH(curses,
         AC_DEFINE(C_CURSOUT,1)])],
    [with_curses=no])
 
+
+CXXFLAGS="$CXXFLAGS -I/Users/aron/Downloads/regal-master/include"
+
+
 AH_TEMPLATE(C_SDLGFX,[Define to 1 to enable SDL graphical output])
 AC_ARG_ENABLE(sdlgfx,AC_HELP_STRING([--enable-sdlgfx],
                                     [Enable SDL graphical output]),[
